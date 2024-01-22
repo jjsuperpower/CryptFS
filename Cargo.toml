@@ -1,0 +1,16 @@
+[package]
+name = "simple_crypt"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.79"
+fuse_mt = "0.6.0"
+hmac = "0.12.1"
+libc = "0.2.147"
+log = "0.4.19"
+openssl = "0.10.55"
+sha2 = "0.10.8"
+thiserror = "1.0.56"
