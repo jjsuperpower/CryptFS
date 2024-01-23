@@ -1,9 +1,6 @@
 use fuse_mt;
 use log::{debug, info};
-use signal_hook::iterator::Signals;
-use signal_hook::consts::{SIGINT,SIGTERM};
 use std::process::Command;
-use std::thread;
 use ctrlc;
 
 mod crypt_fs;
@@ -35,16 +32,6 @@ fn main() -> std::io::Result<()> {
     let mnt_path = "mnt_dir";
     let key = "012345689abcdefg";
     let crypt_fs = CryptFS::new(String::from(key), String::from(src_path), None);
-
-    // let mut signals = Signals::new(&[SIGINT,SIGTERM])?;
-    // thread::spawn(move || {
-    //     for sig in signals.forever() {
-    //         debug!("Received signal {:?}", sig);
-    //         info!("Unmounting and exiting");
-    //         Command::new("umount").arg(mnt_path).spawn().expect("Error unmounting");
-    //         break;
-    //     }
-    // });
 
     ctrlc::set_handler(move || {
         info!("Unmounting and exiting");
