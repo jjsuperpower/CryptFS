@@ -21,10 +21,10 @@ impl log::Log for ConsoleLogger {
 }
 
 
-// main function
+/// TODO: Take arguments from command line
 fn main() -> std::io::Result<()> {
     log::set_logger(&LOGGER).unwrap();
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Info);
 
     debug!("Starting up");
 

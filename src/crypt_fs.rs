@@ -25,6 +25,7 @@ type HmacSha256 = Hmac<Sha256>;
    - File data
    - Padding to make file size a multiple of AES block size
 */
+/// TODO: Change this into a struct
 const AES_128_KEY_SIZE: usize = 16;
 const AES_256_KEY_SIZE: usize = 32;
 const AES_BLOCK_SIZE: usize = 16;
@@ -33,7 +34,6 @@ const MAC_OFFSET: usize = 0;
 const MAC_SIZE: usize = AES_BLOCK_SIZE*2;               // size of a SHA256 digest
 const ORIG_FSIZE_OFFSET: usize = MAC_OFFSET + MAC_SIZE; // offset of original file size in header
 const ORIG_FSIZE_SIZE: usize = 8;                       // size of original file size in header
-
 
 /// Not to be confused with [`CryptoMode`] or [`CryptFSMode`]
 /// 
@@ -53,7 +53,7 @@ pub enum CryptFSMode {
     /// Will only decrypt files, will ignore files without a .cryptfs extension
     DecryptOnly,
     /// Will encrypt files without a .cryptfs extension and decrypt files with a .cryptfs extension
-    Bidirectional,
+    Auto,
 }
 
 pub struct CryptFS   {
@@ -61,8 +61,16 @@ pub struct CryptFS   {
     key: String,
     src_dir: PathBuf,
     mode: CryptFSMode,
+    
 }
 
+/// TODO: Add option to encrypt/decrypt file and directory names - adding them to the header, new filename = hash(filename)
+/// TODO: Add option to use CFB and CTR modes for encryption/decryption (CTR can be parallelized)
+/// TODO: Add option for readwrite mode
+/// TODO: Generate encryption key, encrypt it with a password, store it in a file
+/// TODO: Create config file to store configuration options
+/// TODO: Protect source files by locking them using atomic file locking
+/// TODO: Add option of compressing files before encrypting them
 impl CryptFS {
 
     /// Creates a new CryptFS object
@@ -97,7 +105,7 @@ impl CryptFS {
 
         let mode = match mode {
             Some(mode) => mode,
-            None => CryptFSMode::Bidirectional,
+            None => CryptFSMode::Auto,
         };
     
         return CryptFS {
@@ -142,22 +150,6 @@ impl CryptFS {
     /// Calls [`CryptFS::_crypter`] with [`CryptoMode::Decrypt`] as the mode
     fn _decrypt(&self, data: &[u8], iv:Option<&[u8]>) -> Result<Vec<u8>, CryptFSError> {
         self._crypter(data, iv, CryptoMode::Decrypt)
-    }
-
-    /// Returns the real path of a file
-    /// This is used by the fuse module to get the real path of a fuse file
-    /// # Arguments
-    /// * `path` - Path of the fuse file
-    /// 
-    /// # Returns
-    /// The real path of the file
-    /// 
-    /// # Panics
-    /// This will panic if the Path is empty (no "/" in path)
-    fn get_mapped_path(&self, path: &Path) -> PathBuf {
-        let mut real_path = self.src_dir.clone();
-        real_path.push(path.strip_prefix("/").unwrap());
-        return real_path;
     }
 
     /// Reads a file into a padded buffer of bytes
@@ -233,8 +225,6 @@ impl CryptFS {
         // there is no need to encrypt/decrypt an empty file
         if file_size == 0 {
             return Ok(new_size);
-        } else if (file_size as usize) < HEADER_SIZE {
-            return Err(CryptFSError::InvalidFileSize);
         }
 
         match mode {
@@ -244,7 +234,7 @@ impl CryptFS {
             },
             CryptMode::Decrypt => {
                 if file_size < HEADER_SIZE as u64 {
-                    new_size = file_size; // if this happens, the file is corrupted or was never encrypted to begin with
+                    return Err(CryptFSError::InvalidFileSize);
                 } else {
                     let mut size: [u8; 8] = [0; 8];
                     fs::File::read_exact_at(&file, &mut size, ORIG_FSIZE_OFFSET as u64)?;
@@ -359,22 +349,46 @@ impl CryptFS {
     /// `Option<&Path>` - Path of the file that caused the error
     /// 
     fn log_error(&self, err: CryptFSError, path: Option<&Path>) {
-        if let Some(path) = path {
-            error!("CryptFSError for file: {} in {}\nerror: {}", err, path.display(), self.src_dir.display());
-        } else {
-            error!("CryptFSError: {}", err);
-        }
 
-        match err {
-            CryptFSError::InternalError(err) => {
-                let stack_trace = err.backtrace();
+        let show_as_err = || {
+            if let Some(path) = path {
+                error!("'{}' for '{}'", err, path.display());
+            } else {
+                error!("'{}'", err);
+            }
+        };
+
+        let show_as_info = || {
+            if let Some(path) = path {
+                info!("'{}' for '{}'", err, path.display());
+            } else {
+                info!("'{}'", err);
+            }
+        };
+
+        match &err {
+            CryptFSError::InternalError(anyhow_err) => {
+                show_as_err();
+
+                let stack_trace = anyhow_err.backtrace();
                 if std::backtrace::Backtrace::status(stack_trace) == std::backtrace::BacktraceStatus::Disabled {
-                    error!("--------------------------------------------------");
-                    error!("  To view stack trace, run with RUST_BACKTRACE=1  ");
-                    error!("--------------------------------------------------");
+                    info!("-----------------------------------------------------");
+                    info!("  To view stack trace, run with RUST_BACKTRACE=full  ");
+                    info!("-----------------------------------------------------");
+                } else {
+                    println!("Start of stack trace");
+                    println!("-------------------------------");
+                    println!("{}", stack_trace.to_string());
+                    println!("-------------------------------");
+                    println!("End of stack trace");
                 }
             }
-            _ => (),
+            CryptFSError::InvalidPath => {
+                show_as_info();
+            }
+            _ => {
+                show_as_err();
+            },
         }
     }
 
