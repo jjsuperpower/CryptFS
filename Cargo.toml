@@ -7,10 +7,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.79"
+ctrlc = { version = "3.4.2", features = ["termination"] }
 fuse_mt = "0.6.0"
 hmac = "0.12.1"
 libc = "0.2.147"
 log = "0.4.19"
 openssl = "0.10.55"
 sha2 = "0.10.8"
+signal-hook = "0.3.17"
 thiserror = "1.0.56"
