@@ -16,24 +16,70 @@ use error::CryptFSError;
 
 type HmacSha256 = Hmac<Sha256>;
 
-
-/* Constants used for encryption/decryption
-   Header is composed of:
-   - MAC (SHA256 digest)
-   - Original file size (8 bytes or u64 big endian)
-   - 16 bytes of padding, will be corrupted during decryption
-   - File data
-   - Padding to make file size a multiple of AES block size
-*/
 /// TODO: Change this into a struct
 const AES_128_KEY_SIZE: usize = 16;
 const AES_256_KEY_SIZE: usize = 32;
 const AES_BLOCK_SIZE: usize = 16;
-const HEADER_SIZE: usize = AES_BLOCK_SIZE*4;            // must be multiple of AES_BLOCK_SIZE, else first block will be corrupted during decryption
-const MAC_OFFSET: usize = 0;
-const MAC_SIZE: usize = AES_BLOCK_SIZE*2;               // size of a SHA256 digest
-const ORIG_FSIZE_OFFSET: usize = MAC_OFFSET + MAC_SIZE; // offset of original file size in header
-const ORIG_FSIZE_SIZE: usize = 8;                       // size of original file size in header
+const MAC_SIZE: usize = (256 / 8) as usize;
+const U64_SIZE: usize = (u64::BITS / 8) as usize;
+const HEADER_SIZE: usize = AES_BLOCK_SIZE * 4;
+
+/// Header of encrypted files
+/// Going from top to bottom (most significant to least significant):
+/// * `MAC` - SHA256 digest 
+/// * `empty` - required padding, will be corrupted during decryption
+/// * `orig_file_size` - Original file size (8 bytes or u64 big endian)
+/// * `zeros` - A easy way to check if the header is valid
+struct CryptFSHeader {
+    pub header_mac: [u8; MAC_SIZE],
+    pub data_mac: [u8; MAC_SIZE],
+    empty: [u8; AES_BLOCK_SIZE],
+    pub file_size: u64,
+    pub file_name: [u8; 256],
+    zero: [u8; 8],
+}
+
+impl CryptFSHeader {
+    /// Creates a new header
+    /// Initializes all fields to zero
+    fn new() -> Self {
+        return CryptFSHeader {
+            header_mac: [0; 32],
+            data_mac: [0; 32],
+            empty: [0; 16],
+            orig_file_size: 0,
+            zeros: [0; 8],
+        };
+    }
+
+    /// Packs the header into a vector of bytes
+    /// Order of bytes is:
+    /// * `MAC`
+    /// * `empty`
+    /// * `orig_file_size`
+    /// * `zeros`
+    fn pack(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(HEADER_SIZE);
+        for 
+    }
+    // fn pack(&self) -> Vec<u8> {
+    //     let mut buf = Vec::with_capacity(HEADER_SIZE);
+    //     buf.extend_from_slice(&self.mac);
+    //     buf.extend_from_slice(&self.empty);
+    //     buf.extend_from_slice(&self.orig_file_size.to_be_bytes());
+    //     buf.extend_from_slice(&self.zeros);
+    //     assert!(buf.len() == HEADER_SIZE);
+    //     return buf;
+    // }
+
+    fn unpack(&mut self, data: &[u8]) {
+        self.mac.copy_from_slice(&data[0..MAC_SIZE]);
+        self.empty.copy_from_slice(&data[MAC_SIZE..MAC_SIZE+AES_BLOCK_SIZE]);
+        self.orig_file_size = u64::from_be_bytes(data[MAC_SIZE+AES_BLOCK_SIZE..MAC_SIZE+AES_BLOCK_SIZE+U64_SIZE].try_into().unwrap());
+        self.zeros.copy_from_slice(&data[MAC_SIZE+AES_BLOCK_SIZE+U64_SIZE..HEADER_SIZE]);
+    }
+}
+
 
 /// Not to be confused with [`CryptoMode`] or [`CryptFSMode`]
 /// 
@@ -266,7 +312,7 @@ impl CryptFS {
     /// 
     /// # Panics
     /// If the buffer is not the correct size
-    fn encrypt(&self, data: &Vec<u8>, orig_size: u64) -> Result<Vec<u8>, CryptFSError> {
+    fn encrypt_file(&self, data: &Vec<u8>, orig_size: u64) -> Result<Vec<u8>, CryptFSError> {
 
         // get iv from file hash, this makes it repeatable for the same file
         let iv = &hash(MessageDigest::md5(), &data[HEADER_SIZE..])?[..];
@@ -302,7 +348,7 @@ impl CryptFS {
     /// 
     /// # Panics
     /// If the buffer is not the correct size
-    fn decrypt(&self, data: &Vec<u8>) -> Result<Vec<u8>, CryptFSError> {
+    fn decrypt_file(&self, data: &Vec<u8>) -> Result<Vec<u8>, CryptFSError> {
         let file_mac = &data[MAC_OFFSET..MAC_OFFSET+MAC_SIZE];
         let computed_mac = self.compute_sha256_hmac(&data[ORIG_FSIZE_OFFSET..])?;
 
