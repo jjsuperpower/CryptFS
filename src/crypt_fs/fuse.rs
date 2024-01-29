@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::mem::forget;
 use std::os::fd::{IntoRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::{fs, os::linux::fs::MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -178,7 +179,7 @@ impl CryptFSFuse for CryptFS {
     /// `CryptMode::Decrypt` - If the file has the .crypt extension
     fn get_crypt_mode(&self, path: &Path) -> CryptMode {  // TODO: Enforce encrypt/decrpyt only mode
 
-        match self.mode {
+        match self.options.mode {
             CryptFSMode::EncryptOnly => return CryptMode::Encrypt,
             CryptFSMode::DecryptOnly => return CryptMode::Decrypt,
             CryptFSMode::Auto => {
@@ -358,22 +359,57 @@ impl FilesystemMT for CryptFS {
     fn read(&self, _req: RequestInfo, _path: &Path, _fh: u64, _offset: u64, _size: u32, callback: impl FnOnce(ResultSlice<'_>) -> CallbackResult) -> CallbackResult {
         debug!("read() called");
 
-        let mode = if (_fh >> CRYPT_FLAG_POS) == 1 { CryptMode::Decrypt } else { CryptMode::Encrypt };
+        let mode = if (_fh >> CRYPT_FLAG_POS) == CryptMode::Decrypt as u64 { CryptMode::Decrypt } else { CryptMode::Encrypt };
+
+        let _fh = _fh & !(1 << CRYPT_FLAG_POS);     // Clear bit if set
 
         let file = unsafe { fs::File::from_raw_fd(_fh as i32) };
-        let file_size = file.metadata().unwrap().len();
+
+        let file_size = match file.metadata()   {
+            Ok(m) => m.len(),
+            Err(_) => {
+                self.log_error(CryptFSError::InvalidFileSize, Some(_path));
+                return callback(Err(libc::EIO));
+            }
+        };
 
         if file_size == 0 {
             return callback(Ok(&[]));
         }
-        
-        let crypt_file = match self.crypt_translate(&file, mode) {
-            Ok(crypt_file) => crypt_file,
-            Err(e) => {
-                self.log_error(e, Some(_path));
-                return callback(Err(libc::EIO)) 
+
+        let crypt_file: Vec<u8>;
+
+        match mode {
+            CryptMode::Encrypt => {
+                let filename = match _path.file_name() {
+                    Some(n) => n,
+                    None => {
+                        self.log_error(CryptFSError::InvalidPath, Some(_path));
+                        return callback(Err(libc::ENOENT));
+                    }
+                };
+
+                crypt_file = match self.encrypt_file(&file, filename.as_bytes()) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        self.log_error(e, Some(_path));
+                        return callback(Err(libc::EIO));
+                    }
+                };
             }
-        };
+
+            CryptMode::Decrypt => {
+                crypt_file = match self.decrypt_file(&file) {
+                    Ok((data, _)) => data,
+                    Err(e) => {
+                        self.log_error(e, Some(_path));
+                        return callback(Err(libc::EIO));
+                    }
+                };
+            }
+        }
+
+        
 
         if _offset > crypt_file.len() as u64 {
             return callback(Ok(&[]));

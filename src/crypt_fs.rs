@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::os::unix::prelude::FileExt;
 use std::fs;
-use openssl;
+use openssl::{self, cipher};
 use openssl::symm::{Cipher, Crypter, Mode as CryptoMode};
 use openssl::hash::{hash, MessageDigest};
 use sha2::Sha256;
@@ -22,20 +22,22 @@ const AES_256_KEY_SIZE: usize = 32;
 const AES_BLOCK_SIZE: usize = 16;
 const MAC_SIZE: usize = (256 / 8) as usize;
 const U64_SIZE: usize = (u64::BITS / 8) as usize;
-const HEADER_SIZE: usize = AES_BLOCK_SIZE * 4;
+const HEADER_SIZE: usize = AES_BLOCK_SIZE * 22;
 
 /// Header of encrypted files
-/// Going from top to bottom (most significant to least significant):
-/// * `MAC` - SHA256 digest 
-/// * `empty` - required padding, will be corrupted during decryption
-/// * `orig_file_size` - Original file size (8 bytes or u64 big endian)
-/// * `zeros` - A easy way to check if the header is valid
+/// Stores metadata of original file
 struct CryptFSHeader {
+    /// MAC for file header, this includes the `data_mac`
     pub header_mac: [u8; MAC_SIZE],
+    /// MAC for file data
     pub data_mac: [u8; MAC_SIZE],
+    /// This is the start of encryption, it will be corrupted during decryption and discarded
     empty: [u8; AES_BLOCK_SIZE],
+    /// Original file size
     pub file_size: u64,
+    /// Original file name
     pub file_name: [u8; 256],
+    /// Padding to make the header a multiple of AES_BLOCK_SIZE
     zero: [u8; 8],
 }
 
@@ -44,39 +46,37 @@ impl CryptFSHeader {
     /// Initializes all fields to zero
     fn new() -> Self {
         return CryptFSHeader {
-            header_mac: [0; 32],
-            data_mac: [0; 32],
-            empty: [0; 16],
-            orig_file_size: 0,
-            zeros: [0; 8],
+            header_mac: [0; MAC_SIZE],
+            data_mac: [0; MAC_SIZE],
+            empty: [0; AES_BLOCK_SIZE],
+            file_size: 0,
+            file_name: [0; 256],
+            zero: [0; 8],
         };
     }
 
     /// Packs the header into a vector of bytes
-    /// Order of bytes is:
-    /// * `MAC`
-    /// * `empty`
-    /// * `orig_file_size`
-    /// * `zeros`
+    /// Header MAC MSB is MSB of the returned vector
     fn pack(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_SIZE);
-        for 
+        buf.extend_from_slice(&self.header_mac);
+        buf.extend_from_slice(&self.data_mac);
+        buf.extend_from_slice(&self.empty);
+        buf.extend_from_slice(&self.file_size.to_be_bytes());
+        buf.extend_from_slice(&self.file_name);
+        buf.extend_from_slice(&self.zero);
+        assert!(buf.len() == HEADER_SIZE, "Header size is not correct");
+        return buf;
     }
-    // fn pack(&self) -> Vec<u8> {
-    //     let mut buf = Vec::with_capacity(HEADER_SIZE);
-    //     buf.extend_from_slice(&self.mac);
-    //     buf.extend_from_slice(&self.empty);
-    //     buf.extend_from_slice(&self.orig_file_size.to_be_bytes());
-    //     buf.extend_from_slice(&self.zeros);
-    //     assert!(buf.len() == HEADER_SIZE);
-    //     return buf;
-    // }
+
 
     fn unpack(&mut self, data: &[u8]) {
-        self.mac.copy_from_slice(&data[0..MAC_SIZE]);
-        self.empty.copy_from_slice(&data[MAC_SIZE..MAC_SIZE+AES_BLOCK_SIZE]);
-        self.orig_file_size = u64::from_be_bytes(data[MAC_SIZE+AES_BLOCK_SIZE..MAC_SIZE+AES_BLOCK_SIZE+U64_SIZE].try_into().unwrap());
-        self.zeros.copy_from_slice(&data[MAC_SIZE+AES_BLOCK_SIZE+U64_SIZE..HEADER_SIZE]);
+        self.header_mac.copy_from_slice(&data[0..AES_BLOCK_SIZE*2]);
+        self.data_mac.copy_from_slice(&data[AES_BLOCK_SIZE*2..AES_BLOCK_SIZE*4]);
+        self.empty.copy_from_slice(&data[AES_BLOCK_SIZE*4..AES_BLOCK_SIZE*5]);
+        self.file_size = u64::from_be_bytes(data[AES_BLOCK_SIZE*5..AES_BLOCK_SIZE*5+U64_SIZE].try_into().unwrap());
+        self.file_name.copy_from_slice(&data[AES_BLOCK_SIZE*5+U64_SIZE..AES_BLOCK_SIZE*21+U64_SIZE]);
+        self.zero.copy_from_slice(&data[AES_BLOCK_SIZE*21+U64_SIZE..HEADER_SIZE]);
     }
 }
 
@@ -102,12 +102,33 @@ pub enum CryptFSMode {
     Auto,
 }
 
+#[derive(Debug, Clone)]
+pub struct CryptFSOptions {
+    pub mode: CryptFSMode,
+    pub hide_file_names: bool,
+    pub compress_files: bool,
+    pub key_size: usize,
+    pub readwrite: bool,
+}
+
+impl Default for CryptFSOptions {
+    fn default() -> Self {
+        return CryptFSOptions {
+            mode: CryptFSMode::Auto,
+            hide_file_names: true,
+            compress_files: false,
+            key_size: AES_256_KEY_SIZE,
+            readwrite: false,
+        };
+    }
+}
+
+
 pub struct CryptFS   {
     cipher: Cipher,
-    key: String,
+    key: Vec<u8>,
     src_dir: PathBuf,
-    mode: CryptFSMode,
-    
+    options: CryptFSOptions,
 }
 
 /// TODO: Add option to encrypt/decrypt file and directory names - adding them to the header, new filename = hash(filename)
@@ -126,39 +147,47 @@ impl CryptFS {
     /// # Arguments
     /// * `key` - Key to use for encryption/decryption
     /// * `src_dir_path` - Path to the directory that the fuse layer will source files from
-    /// * `mode` - Weather to encrypt, decrypt, or both. Defaults to both
+    /// * `options` - See [`CryptFSOptions`]
     /// 
     /// # Panics
     /// Panics if the directory does not exist.
-    /// Panics if the key is not 16 or 32 bytes.
-    pub fn new(key: String, src_dir_path: String, mode: Option<CryptFSMode>) -> Self {
+    /// Panics if the key size does not equal 128 or 256 
+    pub fn new<S: AsRef<str>>(key: S, src_dir_path: S, options: Option<CryptFSOptions>) -> Self {
+
+        let key = key.as_ref();
+        let src_dir_path = src_dir_path.as_ref();
+        let options = options.unwrap_or_default();
+
         // check directory exists
-        if !fs::metadata(src_dir_path.clone()).is_ok() {
+        if !fs::metadata(src_dir_path).is_ok() {
             error!("Directory does not exist");
             panic!();
         }
 
         let src_dir = PathBuf::from(src_dir_path).canonicalize().unwrap();
 
-        let cipher: Cipher;
-        if key.as_bytes().len() == AES_128_KEY_SIZE {
-            cipher = Cipher::aes_128_cbc();
-        } else if key.as_bytes().len() == AES_256_KEY_SIZE {
-            cipher = Cipher::aes_256_cbc();
-        } else {
-            panic!("Invalid key size");
-        }
+        let key_hash = &hash(MessageDigest::sha256(), key.as_bytes()).unwrap()[..];
 
-        let mode = match mode {
-            Some(mode) => mode,
-            None => CryptFSMode::Auto,
+        let cipher: Cipher;
+        let crypt_key: Vec<u8>;
+
+        match options.key_size {
+            AES_128_KEY_SIZE => {   
+                cipher = Cipher::aes_128_cbc();
+                crypt_key = key_hash[0..AES_128_KEY_SIZE].to_vec();
+            }
+            AES_256_KEY_SIZE => {
+                cipher = Cipher::aes_256_cbc();
+                crypt_key = key_hash[0..AES_256_KEY_SIZE].to_vec();
+            }
+            _ => panic!("Only 128 and 256 encryption is supported"),
         };
     
         return CryptFS {
             cipher: cipher,
-            key: key,
+            key: crypt_key,
             src_dir: src_dir,
-            mode: mode,
+            options: options,
         };
     }
 
@@ -177,7 +206,7 @@ impl CryptFS {
     /// [`CryptFSError::InternalError`] - If there is an internal error.
     /// This *should* never happen
     fn _crypter(&self, data: &[u8], iv:Option<&[u8]>, mode: CryptoMode) -> Result<Vec<u8>, CryptFSError> {
-        let mut c = Crypter::new(self.cipher, mode,self.key.as_bytes(), iv)?;
+        let mut c = Crypter::new(self.cipher, mode, &self.key, iv)?;
         c.pad(false);
         let mut out = vec![0; data.len() + self.cipher.block_size()];
         let count =c.update(data, &mut out)?;
@@ -196,6 +225,39 @@ impl CryptFS {
     /// Calls [`CryptFS::_crypter`] with [`CryptoMode::Decrypt`] as the mode
     fn _decrypt(&self, data: &[u8], iv:Option<&[u8]>) -> Result<Vec<u8>, CryptFSError> {
         self._crypter(data, iv, CryptoMode::Decrypt)
+    }
+
+
+    /// Decrypts the header of an encrypted file
+    /// This will check if the MAC is valid return the header
+    /// 
+    /// # Arguments
+    /// * `data` - Header to decrypt, must be at least [`HEADER_SIZE`] bytes
+    /// 
+    /// # Returns
+    /// A [`CryptFSHeader`] struct containing the decrypted header
+    /// 
+    /// # Errors
+    /// [`CryptFSError::MacMismatch`] - If the MAC does not match the computed MAC
+    /// 
+    /// # Panics
+    /// If data is not the correct size
+    fn decrypt_header(&self, data: &[u8]) -> Result<CryptFSHeader, CryptFSError> {
+        let mut header = CryptFSHeader::new();
+
+        let header_mac = &data[0..MAC_SIZE];
+        let computed_mac = self.compute_sha256_hmac(&data[MAC_SIZE..])?;
+
+        for i in 0..MAC_SIZE {
+            if header_mac[i] != computed_mac[i] {
+                return Err(CryptFSError::MacMismatch);
+            }
+        }
+
+        let dec_data = self._decrypt(&data[MAC_SIZE..], None)?;
+        header.unpack(&dec_data);
+        
+        return Ok(header);
     }
 
     /// Reads a file into a padded buffer of bytes
@@ -240,7 +302,7 @@ impl CryptFS {
     /// # Errors
     /// [`CryptFSError::InternalError`] - If the hmac cannot be computed
     fn compute_sha256_hmac(&self, data: &[u8]) -> Result<Vec<u8>, CryptFSError> {
-        let mut mac = HmacSha256::new_from_slice(self.key.as_bytes())?;
+        let mut mac = HmacSha256::new_from_slice(&self.key)?;
         mac.update(data);
         let mac = mac.finalize().into_bytes();
         return Ok(mac.to_vec());
@@ -282,9 +344,10 @@ impl CryptFS {
                 if file_size < HEADER_SIZE as u64 {
                     return Err(CryptFSError::InvalidFileSize);
                 } else {
-                    let mut size: [u8; 8] = [0; 8];
-                    fs::File::read_exact_at(&file, &mut size, ORIG_FSIZE_OFFSET as u64)?;
-                    new_size = u64::from_be_bytes(size);
+                    let mut header_buf = vec![0; HEADER_SIZE];
+                    file.read_exact_at(&mut header_buf, 0)?;
+                    let header = self.decrypt_header(&header_buf)?;
+                    return Ok(header.file_size);
                 }
             }
         }
@@ -301,33 +364,46 @@ impl CryptFS {
     /// * Padding (if file size is not a multiple of AES block size)
     /// 
     /// # Arguments
-    /// * `data` - Data to encrypt, must be a vector generated by `crypt_read_file`
-    /// * `orig_size` - Original size of the file
+    /// * `file` - Data to encrypt, must be a vector generated by `crypt_read_file`
+    /// * `file_name` - Original name of the file
     /// 
     /// # Returns
     /// Encrypted copy of the file data with a header prepended
     /// 
     /// # Errors
-    /// [`CryptFSError::InternalError`] - If there is an error in encrypting the data
-    /// 
-    /// # Panics
-    /// If the buffer is not the correct size
-    fn encrypt_file(&self, data: &Vec<u8>, orig_size: u64) -> Result<Vec<u8>, CryptFSError> {
+    /// [`CryptFSError`]
+    fn encrypt_file(&self, file: &fs::File, file_name: &[u8]) -> Result<Vec<u8>, CryptFSError> {
 
-        // get iv from file hash, this makes it repeatable for the same file
+        // Get data from file with extra room for header and padding
+        let mut data = self.crypt_read_file(file, CryptMode::Encrypt)?;
+
+        // Add all information to header except the data MAC and header MAC
+        let mut header = CryptFSHeader::new();
+        header.file_size = file.metadata()?.len();
+        header.file_name[..file_name.len()].copy_from_slice(file_name);
+        data[0..HEADER_SIZE].copy_from_slice(&header.pack());
+
+        // Generate random IV and encrypt data starting after the data MAC
+        // A hash is used to generate the IV for two reasons:
+        // 1. It is repeatable, so the IV does not need to be stored
+        // 2. The IV will change if any data is changed
         let iv = &hash(MessageDigest::md5(), &data[HEADER_SIZE..])?[..];
+        let mut enc_buf = self._encrypt(&data[MAC_SIZE*2..], Some(&iv))?;
 
-        // encrypt the file
-        let mut enc_buf = self._encrypt(data.as_slice(), Some(&iv))?;
+        // Add the data MAC to the header, this protects from:
+        // - Data corruption
+        // - Data from padding oracle attacks
+        let data_mac = self.compute_sha256_hmac(&enc_buf[HEADER_SIZE..])?;
+        enc_buf[MAC_SIZE..MAC_SIZE*2].copy_from_slice(&data_mac);
 
-        // add size of original file to header
-        enc_buf[ORIG_FSIZE_OFFSET..ORIG_FSIZE_OFFSET+ORIG_FSIZE_SIZE].copy_from_slice(&orig_size.to_be_bytes());
-
-        // compute mac, include original file size
-        let mac = self.compute_sha256_hmac(&enc_buf[ORIG_FSIZE_OFFSET..])?;
-
-        // add mac to header, 
-        enc_buf[MAC_OFFSET..MAC_OFFSET+MAC_SIZE].copy_from_slice(&mac.as_slice());
+        // Add the header MAC to the header, this protects from:
+        // - Header corruption
+        // - Header from padding oracle attacks
+        // The reason for using two MACs is the header can be decrypted without reading the entire file
+        // while protecting the data from padding oracle attacks
+        // This is needed when listing contents of a directory
+        let header_mac = self.compute_sha256_hmac(&enc_buf[MAC_SIZE..HEADER_SIZE])?;
+        enc_buf[0..MAC_SIZE].copy_from_slice(&header_mac);
 
         return Ok(enc_buf);
         
@@ -337,56 +413,38 @@ impl CryptFS {
     /// Data to be decrypted must have a header
     /// 
     /// # Arguments
-    /// * `data` - Data to decrypt, size must be at least [`HEADER_SIZE`]
+    /// * `file` - Size to decrypt, size must be at least [`HEADER_SIZE`]
     /// 
     /// # Returns
     /// A vector of bytes containing the decrypted data without the header or padding
     /// 
     /// # Errors
-    /// [`CryptFSError::MacMismatch`] - If the MAC does not match the computed MAC
-    /// [`CryptFSError::InternalError`] - If there is an error in decrypting the data
+    /// [`CryptFSError`]
     /// 
     /// # Panics
-    /// If the buffer is not the correct size
-    fn decrypt_file(&self, data: &Vec<u8>) -> Result<Vec<u8>, CryptFSError> {
-        let file_mac = &data[MAC_OFFSET..MAC_OFFSET+MAC_SIZE];
-        let computed_mac = self.compute_sha256_hmac(&data[ORIG_FSIZE_OFFSET..])?;
+    /// If the file size is less than [`HEADER_SIZE`]
+    fn decrypt_file(&self, file: &fs::File) -> Result<(Vec<u8>, CryptFSHeader), CryptFSError> {
 
-        // TODO: Add more explicit error types
+        // Get data and check header MAC
+        let data = self.crypt_read_file(file, CryptMode::Decrypt)?;
+        let header = self.decrypt_header(&data)?;
+        let computed_mac = self.compute_sha256_hmac(&data[HEADER_SIZE..])?;
+
+        // Check data MAC
         for i in 0..MAC_SIZE {
-            if file_mac[i] != computed_mac[i] {
+            if header.data_mac[i] != computed_mac[i] {
                 return Err(CryptFSError::MacMismatch);
             }
         }
 
-        // get original file size from header
-        let orig_file_size = u64::from_be_bytes(data[ORIG_FSIZE_OFFSET..ORIG_FSIZE_OFFSET+ORIG_FSIZE_SIZE].try_into().unwrap());
+        // Decrypt the data
+        let mut dec_buf = self._decrypt(&data[HEADER_SIZE..], Some(&header.empty))?;
+        dec_buf.truncate(header.file_size as usize);
 
-        let dec_buf = self._decrypt(&mut data.as_slice(), None)?;
-
-        // return decrypted data without the header or padding
-        return Ok(dec_buf[HEADER_SIZE..HEADER_SIZE + orig_file_size as usize].to_vec());
+        return Ok((dec_buf, header));
 
     }
 
-    /// Translates file data using the mode specified
-    /// Calls encrypt or decrypt depending on the mode
-    fn crypt_translate(&self, file: &fs::File, mode: CryptMode) -> Result<Vec<u8>, CryptFSError> {
-        let file_data = self.crypt_read_file(file, mode)?;
-        let orig_size = file.metadata().unwrap().len();
-
-        return match mode {
-            CryptMode::Encrypt => {
-                self.encrypt(&file_data, orig_size)
-            }
-            CryptMode::Decrypt => {
-                if (orig_size < HEADER_SIZE as u64) && (orig_size != 0) { // if the file is too small we should not try to decrypt it
-                    return Err(CryptFSError::InvalidFileSize);
-                }
-                self.decrypt(&file_data)
-            },
-        };
-    }
 
     /// Logs the error message to the console
     /// 
