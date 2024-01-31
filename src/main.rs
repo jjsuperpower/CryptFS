@@ -24,7 +24,7 @@ impl log::Log for ConsoleLogger {
 /// TODO: Take arguments from command line
 fn main() -> std::io::Result<()> {
     log::set_logger(&LOGGER).unwrap();
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Debug);
 
     debug!("Starting up");
 
