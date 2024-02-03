@@ -335,10 +335,6 @@ impl CryptFS {
             return Ok(new_size);
         }
 
-        if file_size < HEADER_SIZE as u64 {
-            return Err(CryptFSError::InvalidFileSize);
-        }
-
         match mode {
             CryptMode::Encrypt => {
                 let aes_padding = AES_BLOCK_SIZE as u64 - (file_size % AES_BLOCK_SIZE as u64);
