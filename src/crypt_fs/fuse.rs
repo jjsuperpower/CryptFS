@@ -373,10 +373,6 @@ impl FilesystemMT for CryptFS {
             }
         };
 
-        if file_size == 0 {
-            return callback(Ok(&[]));
-        }
-
         let crypt_file: Vec<u8>;
 
         match mode {
