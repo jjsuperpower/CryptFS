@@ -308,6 +308,31 @@ impl CryptFS {
         let mac = mac.finalize().into_bytes();
         return Ok(mac.to_vec());
     }
+
+
+    /// Reads the header of an encrypted file
+    /// 
+    /// # Arguments
+    /// * `file` - File to read the header of
+    /// 
+    /// # Returns
+    /// A [`CryptFSHeader`] struct containing the header information
+    /// 
+    /// # Errors
+    /// * [`CryptFSError`] - If the file cannot be accessed or the file size is less than [`HEADER_SIZE`]
+    fn read_header(&self, file: &fs::File) -> Result<CryptFSHeader, CryptFSError> {
+        let file_size = file.metadata()?.len();
+
+        if file_size < HEADER_SIZE as u64 {
+            return Err(CryptFSError::InvalidFileSize);
+        } else {
+            let mut header_buf = vec![0; HEADER_SIZE];
+            file.read_exact_at(&mut header_buf, 0)?;
+            let header = self.decrypt_header(&header_buf)?;
+            return Ok(header);
+        }
+    }
+
     
     /// Calculates expected size of encrypted/decrypted file
     /// This can be less or greater than the original file size depending on the encryption mode.
@@ -338,14 +363,7 @@ impl CryptFS {
                 return Ok(new_size);
             },
             CryptMode::Decrypt => {
-                if file_size < HEADER_SIZE as u64 {
-                    return Err(CryptFSError::InvalidFileSize);
-                } else {
-                    let mut header_buf = vec![0; HEADER_SIZE];
-                    file.read_exact_at(&mut header_buf, 0)?;
-                    let header = self.decrypt_header(&header_buf)?;
-                    return Ok(header.file_size);
-                }
+                return Ok(self.read_header(file)?.file_size);
             }
         }
     }

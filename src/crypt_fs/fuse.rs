@@ -215,7 +215,10 @@ impl FilesystemMT for CryptFS {
 
         let file = match fs::File::open(&source_path) {
             Ok(file) => file,
-            Err(_) => return Err(libc::ENOENT),
+            Err(_) => {
+                self.log_error(CryptFSError::InvalidPath, Some(_path));
+                return Err(libc::ENOENT);
+            },
         };
             
         let metadata = match file.metadata() {
@@ -223,17 +226,22 @@ impl FilesystemMT for CryptFS {
             Err(_) => return Err(libc::ENOENT),
         };
 
-        let mode = self.get_crypt_mode(&source_path);
-        let size = match self.get_crypt_read_size(&file, mode) {
-            Ok(size) => size,
-            Err(e) => {
-                self.log_error(e, Some(_path));
-                return Err(libc::EIO);
+        let size = match metadata.is_dir() {
+            true => metadata.len(),
+            false => {
+                let mode = self.get_crypt_mode(&source_path);
+                match self.get_crypt_read_size(&file, mode) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        self.log_error(e, Some(_path));
+                        return Err(libc::EIO);
+                    }
+                }
             }
         };
-
+        
         let f_attr = FileAttr {
-            size: if metadata.is_file() { size } else { metadata.len() },
+            size: size,
             blocks: metadata.st_blocks(),
             atime: metadata.accessed().unwrap(),
             mtime: metadata.modified().unwrap(),
@@ -476,9 +484,35 @@ impl FilesystemMT for CryptFS {
                 continue;
             }
 
-            let path;
+            let path: PathBuf;
+            
             if !source_path.is_dir() {
-                path = CryptFS::_toggle_extension(&source_path);
+                if source_path.extension() == Some(OsStr::new("crypt")) {
+                    let file = match fs::File::open(&source_path) {
+                        Ok(file) => file,
+                        Err(_) => {
+                            self.log_error(CryptFSError::InvalidPath, Some(_path));
+                            continue;
+                        },
+                    };
+                
+                    let header = match self.read_header(&file) {
+                        Ok(header) => header,
+                        Err(e) => {
+                            self.log_error(e, Some(_path));
+                            continue;
+                        }
+                    };
+
+                    let orig_name = OsStr::from_bytes(
+                        // remove zero padding from file name
+                        &header.file_name[..header.file_name.iter().position(|&x| x == 0).unwrap_or(header.file_name.len())]
+                    );
+                    path = PathBuf::from(source_path.with_file_name(orig_name));
+                    
+                } else {
+                    path = source_path;
+                }
             } else {
                 path = source_path;
             }
@@ -492,6 +526,8 @@ impl FilesystemMT for CryptFS {
                 name: name,
                 kind: if path.is_dir() { FileType::Directory } else { FileType::RegularFile }
             });
+
+            // if is a directory and is suppost 
         }
         
         return Ok(entries);
