@@ -4,7 +4,7 @@ use std::process::Command;
 use ctrlc;
 
 mod crypt_fs;
-use crypt_fs::CryptFS;
+use crypt_fs::{CryptFS, CryptFSOptions, CryptFSMode};
 
 struct ConsoleLogger;
 static LOGGER: ConsoleLogger = ConsoleLogger;
@@ -31,7 +31,13 @@ fn main() -> std::io::Result<()> {
     let src_path = "src_dir";
     let mnt_path = "mnt_dir";
     let key = "012345689abcdefg";
-    let crypt_fs = CryptFS::new(String::from(key), String::from(src_path), None);
+
+
+    let mut crypt_options = CryptFSOptions::default();
+    // crypt_options.hide_file_names = true;
+    crypt_options.mode = CryptFSMode::EncryptOnly;
+
+    let crypt_fs = CryptFS::new(String::from(key), String::from(src_path), Some(crypt_options));
 
     ctrlc::set_handler(move || {
         info!("Unmounting and exiting");
