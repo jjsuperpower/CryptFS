@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::mem::forget;
+use std::os;
 use std::os::fd::{IntoRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::{fs, os::linux::fs::MetadataExt};
@@ -18,11 +19,13 @@ const CRYPT_FLAG_POS: u8 = 63;
 
 
 trait CryptFSFuse {
-    fn get_mapped_path(&self, path: &Path) -> PathBuf;
-    fn _toggle_extension(path: &Path) -> std::path::PathBuf;
+    fn get_real_root(&self, path: &Path) -> PathBuf;
+    fn toggle_extension(path: &Path) -> std::path::PathBuf;
     fn is_path_allowed(path: &Path) -> bool;
     fn is_dir(path: &Path) -> bool;
     fn is_file(path: &Path) -> bool;
+    fn get_crypt_dir_real_name(&self, path: &Path) -> Result<PathBuf, CryptFSError>;
+    fn get_crypt_file_real_name(&self, path: &Path) -> Result<PathBuf, CryptFSError>;
     fn get_source_path(&self, path: &Path) -> Result<PathBuf, libc::c_int>;
     fn get_crypt_mode(&self, path: &Path) -> CryptMode;
 }
@@ -40,7 +43,7 @@ impl CryptFSFuse for CryptFS {
     /// 
     /// # Panics
     /// This will panic if the Path is empty (no "/" in path)
-    fn get_mapped_path(&self, path: &Path) -> PathBuf {
+    fn get_real_root(&self, path: &Path) -> PathBuf {
         let mut real_path = self.src_dir.clone();
         real_path.push(path.strip_prefix("/").unwrap());
         return real_path;
@@ -55,7 +58,7 @@ impl CryptFSFuse for CryptFS {
     /// 
     /// # Returns
     /// Path with .crypt extension added or removed
-    fn _toggle_extension(path: &Path) -> std::path::PathBuf {
+    fn toggle_extension(path: &Path) -> std::path::PathBuf {
         let mut path_buf = path.to_path_buf();
         let ext = path_buf.extension();
 
@@ -115,6 +118,27 @@ impl CryptFSFuse for CryptFS {
         return path.is_file() && !path.is_symlink();
     }
 
+    #[inline]
+    fn get_crypt_dir_real_name(&self, path: &Path) -> Result<PathBuf, CryptFSError> {
+
+        let parent = path.parent().unwrap_or(Path::new("/"));
+        let dir_data_path = parent.join(format!(".{}.{}", path.file_name().unwrap().to_str().unwrap(), "dir"));
+
+        if CryptFS::is_file(dir_data_path.as_path()) {
+            let dir_data_file = fs::File::open(&dir_data_path)?;
+            let header = self.read_header(&dir_data_file)?;
+            Ok(PathBuf::from(header.get_file_name()))
+        } else {
+            Ok(path.to_path_buf())  // no metadata file, return the original path
+        }
+    }
+
+    fn get_crypt_file_real_name(&self, path: &Path) -> Result<PathBuf, CryptFSError> {
+        let file = fs::File::open(path)?;
+        let header = self.read_header(&file)?;
+        Ok(PathBuf::from(header.get_file_name()))
+    }
+
     /// Returns the real path of a file
     /// This is used by the fuse module to get the real path of a fuse file
     /// This involves modifyin the directory path and adding or removing the .crypt extension (for files)
@@ -127,44 +151,36 @@ impl CryptFSFuse for CryptFS {
     /// 
     /// # Errors
     /// `libc::ENOENT` - If the source file does not exist
+    /// 
+    /// *TODO:* implement using a hash map, there is no good efficent way to 
+    /// find the correct directory when encrypting with hide_file_names enabled
+    /// as this requires a "guess and check" method
     fn get_source_path(&self, path: &Path) -> Result<PathBuf, libc::c_int> {
 
-        // Files are given the .crypt extension when encrypted.
-        // The extension is removed when the file is decrypted.
-        // Directories are not given the .crypt extension.
-        // The user will not query fuse with the correct file extension
-        // In order for this code to work correctly, we must try both with and without the .crypt extension
-        // to know if the source file is a directory or regular file
-        let source_path = self.get_mapped_path(path);
-        let source_path_alt = CryptFS::_toggle_extension(&source_path);
 
+        let path = path.canonicalize().unwrap();
 
-        // This should be the most common case
-        // The exception is for directories, which will be checked below
-        if source_path_alt.exists() {
-            match CryptFS::is_file(&source_path_alt) {
-                true => return Ok(source_path_alt),
-                false => {
-                    self.log_error(CryptFSError::IrregularFile, Some(path));
-                    return Err(libc::ENOENT);
-                }
-            };
+        // The source root is the one exception to the rule, as this is decided by the user
+        // and the folder name is not encrypted
+        if path == Path::new("/") {
+            return Ok(self.src_dir.clone());
         }
 
-        // A possible security issue is that a caller could get around security by using the .crypt extension
-        // Therefore we verify that the file is a directory, and not a regular file
-        if source_path.exists() {
-            match CryptFS::is_dir(&source_path) {
-                true => return Ok(source_path),
-                false => {
-                    self.log_error(CryptFSError::IrregularFile, Some(path));
-                    return Err(libc::ENOENT);
-                }
-            };
+        let real_path = match self.fpath_map.get(self.get_real_root(&path).as_path()) {
+            Some(real_path) => real_path,
+            None => {
+                self.log_error(CryptFSError::InvalidPath, Some(&path));
+                return Err(libc::ENOENT);
+            }
+        };
+
+        // check to make sure the path is a regular file or directory
+        if !CryptFS::is_path_allowed(real_path) {
+            self.log_error(CryptFSError::InvalidPath, Some(&path));
+            return Err(libc::ENOENT);
         }
 
-        self.log_error(CryptFSError::InvalidPath, Some(path));
-        return Err(libc::ENOENT);
+        Ok(real_path.clone())
     }
 
     
@@ -464,73 +480,142 @@ impl FilesystemMT for CryptFS {
         return Ok((handle, 0));
     }
 
-    fn readdir(&self, _req: RequestInfo, _path: &Path, _fh: u64) -> ResultReaddir {
+    // TODO: Redo this function with the option of hiding file names
+    fn readdir(&mut self, _req: RequestInfo, _path: &Path, _fh: u64) -> ResultReaddir {
         // It would be better to use the libc::readdir() function, but for now I'll just use rust's fs::read_dir()
         debug!("readdir() called");
 
-        let source_path = match self.get_source_path(_path) {
-            Ok(source_path) => source_path,
-            Err(_) => return Err(libc::ENOENT),
-        };
+        let search_path = self.get_source_path(_path)?;
+
+        if !search_path.is_dir() {
+            return Err(libc::ENOTDIR);
+        }
+
+
         let mut entries: Vec<DirectoryEntry> = Vec::new();
 
         // read_dir needs to open the file again, as it calls both opendir() and readdir() and readir underneath
-        for entry in fs::read_dir(source_path.as_path()).unwrap()  {
+        for entry in fs::read_dir(search_path.as_path()).unwrap()  {
             let entry = entry.unwrap();
             let source_path = entry.path();
-            
+            let orig_file_name = PathBuf::from(entry.file_name());
+
             // make sure is either regular file or directory
             if !CryptFS::is_path_allowed(&source_path) {
                 continue;
             }
 
-            let path: PathBuf;
-            
-            if !source_path.is_dir() {
-                if source_path.extension() == Some(OsStr::new("crypt")) {
-                    let file = match fs::File::open(&source_path) {
-                        Ok(file) => file,
-                        Err(_) => {
-                            self.log_error(CryptFSError::InvalidPath, Some(_path));
-                            continue;
-                        },
+            let new_file_name: OsString;
+
+            match self.get_crypt_mode(&source_path) {
+                CryptMode::Encrypt => {
+
+                    let new_name = if self.options.hide_file_names {
+                        // hide the file name behind a hmac
+                        match self.get_crypt_filename(&orig_file_name.to_string_lossy()) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                self.log_error(e, Some(_path));
+                                continue;
+                            }
+                        }
+                    } else {
+                        // just add the .crypt extension
+                        orig_file_name.to_string_lossy().to_string()
                     };
-                
-                    let header = match self.read_header(&file) {
-                        Ok(header) => header,
-                        Err(e) => {
-                            self.log_error(e, Some(_path));
-                            continue;
+
+                    new_file_name = CryptFS::toggle_extension(&PathBuf::from(new_name)).into();
+
+                    // directories have an additional (virtual) file that will be added later
+                    if source_path.is_dir() {
+                        let dir_file_name = OsStr::new(format!(".{}.{}", new_name, "dir").as_str());
+
+                        entries.push(DirectoryEntry {
+                            name: dir_file_name.to_os_string(),
+                            kind: FileType::RegularFile
+                        });
+                    }
+                },
+                CryptMode::Decrypt => {
+
+                    let new_name = if CryptFS::is_file(&source_path) {
+                        match self.get_crypt_file_real_name(&source_path) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                self.log_error(e, Some(_path));
+                                continue;
+                            }
+                        }
+                    } else {
+                        match self.get_crypt_dir_real_name(&source_path) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                self.log_error(e, Some(_path));
+                                continue;
+                            }
                         }
                     };
 
-                    let orig_name = OsStr::from_bytes(
-                        // remove zero padding from file name
-                        &header.file_name[..header.file_name.iter().position(|&x| x == 0).unwrap_or(header.file_name.len())]
-                    );
-                    path = PathBuf::from(source_path.with_file_name(orig_name));
-                    
-                } else {
-                    path = source_path;
+                    new_file_name = new_name.into();
                 }
-            } else {
-                path = source_path;
             }
 
-            let name: OsString = match path.file_name() {
-                Some(name) => name.to_owned(),
-                None => continue,
-            };
+            // update hash map with new file name
+            let mut new_path = source_path.clone();
+            new_path.set_file_name(new_file_name.clone());
+            self.fpath_map.insert(new_path, source_path);
+            
+            // if !source_path.is_dir() {
+            //     if source_path.extension() == Some(OsStr::new("crypt")) {
+            //         let file = match fs::File::open(&source_path) {
+            //             Ok(file) => file,
+            //             Err(_) => {
+            //                 self.log_error(CryptFSError::InvalidPath, Some(_path));
+            //                 continue;
+            //             },
+            //         };
+                
+            //         let header = match self.read_header(&file) {
+            //             Ok(header) => header,
+            //             Err(e) => {
+            //                 self.log_error(e, Some(_path));
+            //                 continue;
+            //             }
+            //         };
 
-            entries.push(DirectoryEntry {
-                name: name,
-                kind: if path.is_dir() { FileType::Directory } else { FileType::RegularFile }
-            });
+            //         let orig_name = OsStr::from_bytes(
+            //             // remove zero padding from file name
+            //             &header.file_name[..header.file_name.iter().position(|&x| x == 0).unwrap_or(header.file_name.len())]
+            //         );
+            //         path = PathBuf::from(source_path.with_file_name(orig_name));
+                    
+            //     } else {
+            //         path = source_path;
+            //     }
 
-            // if is a directory and is suppost 
+            // // check if file hidden file with the same name with a .dir extension
+            // // if so this contains the file name
+            // } else if CryptFS::is_file(source_path.parent().unwrap().join(format!(".{}", source_path.file_name().unwrap().to_str().unwrap())).as_path()) {
+            //     let dir_file = source_path.parent().unwrap().join(format!(".{}", source_path.file_name().unwrap().to_str().unwrap()));
+
+                
+            // } else {
+            //     path = source_path;
+            // }
+
+            // let name: OsString = match path.file_name() {
+            //     Some(name) => name.to_owned(),
+            //     None => continue,
+            // };
+
+            // entries.push(DirectoryEntry {
+            //     name: name,
+            //     kind: if path.is_dir() { FileType::Directory } else { FileType::RegularFile }
+            // });
         }
         
-        return Ok(entries);
+        // return Ok(entries);
+        return Err(libc::ENOSYS);
 
     }
 
