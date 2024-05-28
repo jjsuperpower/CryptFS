@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::os::unix::prelude::FileExt;
 use std::fs;
@@ -77,6 +78,34 @@ impl CryptFSHeader {
         self.file_name.copy_from_slice(&data[AES_BLOCK_SIZE*5+U64_SIZE..AES_BLOCK_SIZE*21+U64_SIZE]);
         self.zero.copy_from_slice(&data[AES_BLOCK_SIZE*21+U64_SIZE..HEADER_SIZE]);
     }
+
+    /// Returnst the file_name buffer as a string
+    /// 
+    /// This will strip out extra null bytes.
+    /// 
+    /// > Note: [`CryptFSHeader::unpack`] must be called before this function will be effective.
+    /// > If it is not called before, the string returned will be empty.
+    /// 
+    /// # Returns
+    /// A string containing the file name
+    fn get_file_name(&self) -> String {
+        self.file_name.iter().take_while(|&&c| c != 0).map(|&c| c as char).collect()
+    }
+
+    /// Sets the file name in the struct.
+    ///
+    /// This function takes a string slice `file_name` as input and copies its bytes into the `file_name` field of the struct.
+    /// The `file_name` field must be a byte array.
+    ///
+    /// # Arguments
+    ///
+    /// - `file_name`  A string slice that holds the new file name.
+    ///
+    /// # Panics
+    /// This function will panic if `file_name.len()` is greater than file name buffer.
+    fn set_file_name(&mut self, file_name: &str) {
+        self.file_name[..file_name.len()].copy_from_slice(file_name.as_bytes());
+    }
     
 }
 
@@ -129,6 +158,7 @@ pub struct CryptFS   {
     key: Vec<u8>,
     src_dir: PathBuf,
     options: CryptFSOptions,
+    fpath_map: HashMap<PathBuf, PathBuf>
 }
 
 /// TODO: Add option to encrypt/decrypt file and directory names - adding them to the header, new filename = hash(filename)
@@ -188,6 +218,7 @@ impl CryptFS {
             key: crypt_key,
             src_dir: src_dir,
             options: options,
+            fpath_map: HashMap::new(),
         };
     }
 
@@ -307,6 +338,32 @@ impl CryptFS {
         mac.update(data);
         let mac = mac.finalize().into_bytes();
         return Ok(mac.to_vec());
+    }
+
+    /// Computes a SHA256 HMAC of the input file name and returns a new file name.
+    ///
+    /// This method takes a string slice `file_name` as input, computes a SHA256 HMAC of it, and then generates a new file name
+    /// from the first 16 bytes of the HMAC. Each byte of the HMAC is converted to a two-digit hexadecimal string, so the new file name
+    /// is 32 characters long.
+    ///
+    /// # Arguments
+    ///
+    /// - `file_name` - A string slice that holds the original file name.
+    ///
+    /// # Returns
+    /// A string containing the new file name. Note this new name does not have any file extension.
+    ///
+    /// # Errors
+    /// This method returns a [`CryptFSError`] error if the computation of the HMAC fails.
+    fn get_crypt_filename(&self, file_name: &str) -> Result<String, CryptFSError> {
+        // Compute the SHA256 HMAC of the file name
+        let hmac = self.compute_sha256_hmac(file_name.as_bytes())?;
+
+        // Generate a new file name from the first 16 bytes of the HMAC
+        let new_name = hmac.iter().take(16).map(|x| format!("{:02x}", x)).collect();
+
+        // Return the new file name
+        Ok(new_name)
     }
 
 
